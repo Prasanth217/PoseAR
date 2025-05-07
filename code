@@ -1,0 +1,130 @@
+import cv2
+import mediapipe as mp
+import numpy as np
+import csv
+import time
+
+mp_drawing = mp.solutions.drawing_utils
+mp_pose = mp.solutions.pose
+
+def calculate_angle(a, b, c):
+    a, b, c = np.array(a), np.array(b), np.array(c)
+    ba = a - b
+    bc = c - b
+    cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
+    angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
+    return np.degrees(angle)
+
+# Initial state
+rep_count = 0
+stage = None
+
+cap = cv2.VideoCapture(0)
+csv_file = open('posear_log.csv', mode='w', newline='')
+csv_writer = csv.writer(csv_file)
+csv_writer.writerow(['Timestamp', 'Leg', 'Knee Angle', 'Back Angle', 'Knee Feedback', 'Back Feedback', 'Reps'])
+
+with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image.flags.writeable = False
+        results = pose.process(image)
+        image.flags.writeable = True
+        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+
+        if results.pose_landmarks:
+            lm = results.pose_landmarks.landmark
+
+            # Calculate which side is more visible
+            left_score = sum([lm[mp_pose.PoseLandmark.LEFT_HIP.value].visibility,
+                              lm[mp_pose.PoseLandmark.LEFT_KNEE.value].visibility,
+                              lm[mp_pose.PoseLandmark.LEFT_ANKLE.value].visibility])
+
+            right_score = sum([lm[mp_pose.PoseLandmark.RIGHT_HIP.value].visibility,
+                               lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].visibility,
+                               lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].visibility])
+
+            if right_score > left_score:
+                side = "Right"
+                SHOULDER = mp_pose.PoseLandmark.RIGHT_SHOULDER
+                HIP = mp_pose.PoseLandmark.RIGHT_HIP
+                KNEE = mp_pose.PoseLandmark.RIGHT_KNEE
+                ANKLE = mp_pose.PoseLandmark.RIGHT_ANKLE
+            else:
+                side = "Left"
+                SHOULDER = mp_pose.PoseLandmark.LEFT_SHOULDER
+                HIP = mp_pose.PoseLandmark.LEFT_HIP
+                KNEE = mp_pose.PoseLandmark.LEFT_KNEE
+                ANKLE = mp_pose.PoseLandmark.LEFT_ANKLE
+
+            shoulder_lm = lm[SHOULDER.value]
+            hip_lm = lm[HIP.value]
+            knee_lm = lm[KNEE.value]
+            ankle_lm = lm[ANKLE.value]
+
+            if all(p.visibility > 0.7 for p in [shoulder_lm, hip_lm, knee_lm, ankle_lm]):
+                shoulder = [shoulder_lm.x, shoulder_lm.y]
+                hip = [hip_lm.x, hip_lm.y]
+                knee = [knee_lm.x, knee_lm.y]
+                ankle = [ankle_lm.x, ankle_lm.y]
+
+                knee_angle = calculate_angle(hip, knee, ankle)
+                back_angle = calculate_angle(shoulder, hip, knee)
+
+                # Feedback for knee
+                if knee_angle > 100:
+                    knee_feedback = "Bend more!"
+                    color = (0, 0, 255)
+                elif 80 <= knee_angle <= 100:
+                    knee_feedback = "Good Squat!"
+                    color = (0, 255, 0)
+                else:
+                    knee_feedback = "Too low!"
+                    color = (0, 165, 255)
+
+                # Feedback for back
+                if back_angle < 85:
+                    back_feedback = "Keep Back Straight!"
+                    back_color = (0, 0, 255)
+                else:
+                    back_feedback = "Back Straight"
+                    back_color = (0, 255, 0)
+
+                # Rep logic
+                if knee_angle > 160:
+                    stage = 'up'
+                elif knee_angle < 100 and stage == 'up':
+                    stage = 'down'
+                    rep_count += 1
+                    print(f"✅ Rep counted! Total: {rep_count}")
+
+                # Log to CSV
+                timestamp = time.strftime("%H:%M:%S")
+                csv_writer.writerow([timestamp, side, round(knee_angle, 2), round(back_angle, 2),
+                                     knee_feedback, back_feedback, rep_count])
+
+                # Draw feedback overlays
+                h, w, _ = image.shape
+                x, y = int(knee_lm.x * w), int(knee_lm.y * h)
+                cv2.circle(image, (x, y), 12, color, -1)
+
+                cv2.putText(image, f"{side} Leg | Reps: {rep_count}", (30, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 3, cv2.LINE_AA)
+                cv2.putText(image, f"Knee: {int(knee_angle)}° - {knee_feedback}", (30, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2, cv2.LINE_AA)
+                cv2.putText(image, f"Back: {int(back_angle)}° - {back_feedback}", (30, 120),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, back_color, 2, cv2.LINE_AA)
+
+            mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+
+        cv2.imshow('PoseAR - Auto Leg Detection', image)
+        if cv2.waitKey(10) & 0xFF == ord('q'):
+            break
+
+cap.release()
+csv_file.close()
+cv2.destroyAllWindows()
